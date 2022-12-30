@@ -1,6 +1,6 @@
-Building the tnfs daemon
-========================
+# Building the tnfs daemon
 
+cd into src
 Use the command 'make OS=osname'.
 The following is valid:
 
