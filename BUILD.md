@@ -1,12 +1,14 @@
 # Building the tnfs daemon
 
-> `cd` into `src`
-> Use the command `make OS=osname`.
-> The following is valid:
+* `cd` into `src`
+* Use the command `make OS=osname`.
+* The following is valid:
 
+```
    make OS=LINUX       All versions of Linux
    make OS=BSD         Use this also for macOS. Has been tested on OpenBSD.
    make OS=Windows_NT  All versions of Windows (with MinGW)
+```
 
 If using Windows with cygwin, it's probable you'll need to use
 make `OS=LINUX` instead since Cygwin looks more like Linux than Windows.
