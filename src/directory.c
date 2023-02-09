@@ -108,12 +108,19 @@ static unsigned next_prime(unsigned seed) {
 directory_entry_list dirlist_concat(directory_entry_list list1, directory_entry_list list2);
 
 char root[MAX_ROOT]; /* root for all operations */
+char realroot[MAX_ROOT]; /* full path of the tnfs root dir */
 char dirbuf[MAX_FILEPATH];
 
 int tnfs_setroot(char *rootdir)
 {
 	if (strlen(rootdir) > MAX_ROOT)
 		return -1;
+
+#ifdef WIN32
+	GetFullPathNameA(rootdir, MAX_ROOT, realroot, NULL);
+#else
+	realpath(rootdir, realroot);
+#endif
 
 	strlcpy(root, rootdir, MAX_ROOT);
 	return 0;
@@ -161,6 +168,39 @@ void get_root(Session *s, char *buf, int bufsz)
 	else
 	{
 		snprintf(buf, bufsz, "%s/%s/", root, s->root);
+	}
+}
+
+/* validates the path is inside our root dir
+   Returns 1 if path is inside tnfs root
+   Returns 0 if path is outside tnfs root */
+int validate_path(Session *s, const char *path)
+{
+	char valpath[MAX_FILEPATH];
+
+#ifdef WIN32
+	GetFullPathNameA(path, MAX_FILEPATH, valpath, NULL);
+#else
+	realpath(path, valpath);
+#endif
+
+#ifdef DEBUG
+	fprintf(stderr, "validate path: %s::%s == ", valpath, realroot);
+#endif
+
+	if (strstr(valpath, realroot) != NULL)
+	{
+#ifdef DEBUG
+	fprintf(stderr, "PASSED\n");
+#endif
+		return 1;
+	}
+	else
+	{
+#ifdef DEBUG
+	fprintf(stderr, "FAILED\n");
+#endif
+		return 0;
 	}
 }
 
@@ -286,6 +326,10 @@ void tnfs_opendir(Header *hdr, Session *s, unsigned char *databuf, int datasz)
 					 root, s->root, databuf);
 			normalize_path(s->dhandles[i].path, path, MAX_TNFSPATH);
 
+			/* set path to root if requested path is outside tnfs root */
+			if (!validate_path(s, s->dhandles[i].path))
+				strcpy(s->dhandles[i].path, root);
+
 			/* scan directory */
 			struct dirent **namelist;
 			int n = scandir(s->dhandles[i].path, &namelist, NULL, alphacase_sort);
@@ -314,6 +358,10 @@ void tnfs_opendir(Header *hdr, Session *s, unsigned char *databuf, int datasz)
 			snprintf(path, MAX_TNFSPATH, "%s/%s/%s",
 					 root, s->root, databuf);
 			normalize_path(s->dhandles[i].path, path, MAX_TNFSPATH);
+
+			/* set path to root if requested path is outside tnfs root */
+			if (!validate_path(s, s->dhandles[i].path))
+				strcpy(s->dhandles[i].path, root);
 
 			if ((dptr = opendir(s->dhandles[i].path)) != NULL)
 			{
@@ -917,6 +965,10 @@ void tnfs_opendirx(Header *hdr, Session *s, unsigned char *databuf, int datasz)
 
 			// Remove any doubled-up path separators
 			normalize_path(s->dhandles[i].path, path, MAX_TNFSPATH);
+
+			/* set path to root if requested path is outside tnfs root */
+			if (!validate_path(s, s->dhandles[i].path))
+				strcpy(s->dhandles[i].path, root);
 
 			result = _load_directory(&(s->dhandles[i]), diropts, sortopts, maxresults, pPattern);
 			if (result == 0)
