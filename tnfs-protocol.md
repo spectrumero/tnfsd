@@ -97,7 +97,7 @@ datagrams:
 
 ```
     Bytes 0,1  Connection ID (ignored for client's "mount" command)
-    Byte  2	   Retry number
+    Byte  2	   Sequence number, must be incremented for each new request
     Byte  3	   Command
 ```
 
