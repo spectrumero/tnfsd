@@ -21,7 +21,12 @@ void tnfs_event_init()
 bool tnfs_event_register(int fd)
 {
     struct epoll_event ev;
-    ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
+    /*
+     * Socket handlers consume one datagram, connection, or read per main-loop
+     * iteration. Use level-triggered notifications so descriptors remain
+     * ready while the kernel still has input queued for them.
+     */
+    ev.events = EPOLLIN | EPOLLRDHUP;
     ev.data.fd = fd;
 
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == -1)

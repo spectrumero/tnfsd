@@ -30,6 +30,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y xa65
       - name: Build tnfsd
         run: cd /home/runner/work/tnfsd/tnfsd/src && make OS=LINUX DEBUG=yes USAGELOG=yes
+      - name: Test queued UDP datagrams
+        run: python3 tests/test_udp_burst.py bin/tnfsd
       - uses: actions/upload-artifact@master
         with:
           name: tnfsd_linux-x64
@@ -62,4 +64,3 @@ jobs:
         with:
           name: tnfsd_macos-x64
           path: bin/tnfsd
-

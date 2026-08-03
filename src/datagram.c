@@ -439,6 +439,23 @@ void tnfs_handle_udpmsg()
 	rxbytes = recvfrom(sockfd, (char *)rxbuf, sizeof(rxbuf), 0,
 					   (struct sockaddr *)&cliaddr, &len);
 
+#ifdef WIN32
+	if (rxbytes == SOCKET_ERROR)
+	{
+		LOG("recvfrom() failed: %d\n", WSAGetLastError());
+		return;
+	}
+#else
+	if (rxbytes < 0)
+	{
+		if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)
+		{
+			LOG("recvfrom() failed: %s\n", strerror(errno));
+		}
+		return;
+	}
+#endif
+
 	if (rxbytes >= TNFS_HEADERSZ)
 	{
 		/* probably a valid TNFS packet, decode it */
@@ -449,8 +466,6 @@ void tnfs_handle_udpmsg()
 		MSGLOG(cliaddr.sin_addr.s_addr,
 			   "Invalid datagram received");
 	}
-
-	*(rxbuf + rxbytes) = 0;
 }
 
 void tnfs_handle_tcpmsg(TcpConnection *tcp_conn)
