@@ -28,6 +28,8 @@ jobs:
         uses: actions/checkout@v4
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y xa65
+      - name: Test chroot build configuration
+        run: python3 tests/test_make_chroot.py
       - name: Build tnfsd
         run: cd /home/runner/work/tnfsd/tnfsd/src && make OS=LINUX DEBUG=yes USAGELOG=yes
       - name: Test queued UDP datagrams

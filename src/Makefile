@@ -54,7 +54,7 @@ ifdef USAGELOG
     LOGFLAGS = -DUSAGELOG
 endif
 
-CFLAGS=$(FLAGS) $(EXFLAGS) $(LOGFLAGS) -DNEED_ERRTABLE
+CFLAGS=$(FLAGS) $(CHROOTFLAGS) $(EXFLAGS) $(LOGFLAGS) -DNEED_ERRTABLE
 OBJS=main.o datagram.o event_common.o log.o session.o endian.o directory.o errortable.o tnfs_file.o chroot.o fileinfo.o stats.o auth.o traverse.o match.o tnfsd.o atari.o $(EXOBJS)
 
 # Check if boot sector assembly source exists
@@ -92,4 +92,3 @@ endif
 
 clean:
 	$(RM) -f $(OBJS) atari_bootsector.bin atari_bootsector.h bin/$(EXEC)
-
