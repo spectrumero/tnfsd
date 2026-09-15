@@ -1318,19 +1318,23 @@ void _tnfs_free_dir_handle(dir_handle* dhandle)
 	#ifdef TNFS_DIR_EXT
 	/* deallocate ext iterator */
 	struct tnfs_opendir_ext *handle = (struct tnfs_opendir_ext*) dhandle->handle;
-	for(int i = 0; i < handle->total; ++i)
+	/* A slot can be reclaimed before opendir succeeded, leaving no iterator. */
+	if (handle != NULL)
 	{
-		free(handle->namelist[i]);
+		for(int i = 0; i < handle->total; ++i)
+		{
+			free(handle->namelist[i]);
+		}
+		if(handle->namelist) free(handle->namelist);
+		if(handle->wildcard) free(handle->wildcard);
+		if(handle->ignore_patterns)
+		{
+			for (int i = 0; i < handle->ignore_count; ++i)
+				free(handle->ignore_patterns[i]);
+			free(handle->ignore_patterns);
+		}
+		free(handle);
 	}
-	if(handle->namelist) free(handle->namelist);
-	if(handle->wildcard) free(handle->wildcard);
-	if(handle->ignore_patterns)
-	{
-		for (int i = 0; i < handle->ignore_count; ++i)
-			free(handle->ignore_patterns[i]);
-		free(handle->ignore_patterns);
-	}
-	free(handle);
 #else
 	if (dhandle->handle != NULL)
 	{
@@ -1347,6 +1351,7 @@ void _tnfs_free_dir_handle(dir_handle* dhandle)
 	dirlist_free(dhandle->entry_list);
 	dhandle->current_entry = dhandle->entry_list = NULL;
 	dhandle->entry_count = 0;
+	dhandle->open = false;
 	dhandle->loaded = false;
 }
 

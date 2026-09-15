@@ -433,6 +433,20 @@ static void tcp_accept_drain_reserve(void)
 }
 #endif
 
+/* Winsock reports through WSAGetLastError(), so errno is never set and
+ * strerror() would describe an error nothing raised. */
+static const char *tcp_accept_strerror(int err)
+{
+#ifdef WIN32
+	static char buf[32];
+
+	snprintf(buf, sizeof(buf), "WSA error %d", err);
+	return buf;
+#else
+	return strerror(err);
+#endif
+}
+
 /* Under fd exhaustion this fires on every pass of the loop, so rate-limit it. */
 static void tcp_accept_warn(int err)
 {
@@ -448,9 +462,9 @@ static void tcp_accept_warn(int err)
 
 	if (suppressed > 0)
 		LOG("unable to accept TCP connection: %s (%lu more suppressed)\n",
-			strerror(err), suppressed);
+			tcp_accept_strerror(err), suppressed);
 	else
-		LOG("unable to accept TCP connection: %s\n", strerror(err));
+		LOG("unable to accept TCP connection: %s\n", tcp_accept_strerror(err));
 
 	last_warn = now;
 	suppressed = 0;
@@ -490,9 +504,21 @@ void tcp_accept(TcpConnection *tcp_conn_list)
 
 	acc_fd = accept(tcplistenfd, (struct sockaddr *)&cliaddr, &cli_len);
 
+	/* accept() yields INVALID_SOCKET on Windows, which truncates to -1 here.
+	 * Don't compare against INVALID_SOCKET directly: it is unsigned and wider
+	 * than int on 64-bit, so the comparison would never be true. */
 	if (acc_fd < 0)
 	{
-#ifndef WIN32
+#ifdef WIN32
+		int accept_error = WSAGetLastError();
+
+		tcp_accept_warn(accept_error);
+
+		/* No reserve-descriptor trick here, so simply stop spinning on a
+		 * listener that stays readable while the process is out of handles. */
+		if (accept_error == WSAEMFILE || accept_error == WSAENOBUFS)
+			Sleep(TCP_ACCEPT_RESOURCE_BACKOFF_MS);
+#else
 		switch (errno)
 		{
 		case EINTR:
@@ -513,8 +539,9 @@ void tcp_accept(TcpConnection *tcp_conn_list)
 		default:
 			break;
 		}
-#endif
+
 		tcp_accept_warn(errno);
+#endif
 		return;
 	}
 

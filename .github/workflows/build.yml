@@ -32,6 +32,10 @@ jobs:
         run: cd /home/runner/work/tnfsd/tnfsd/src && make OS=LINUX DEBUG=yes USAGELOG=yes
       - name: Test queued UDP datagrams
         run: python3 tests/test_udp_burst.py bin/tnfsd
+      - name: Test directory handle leak
+        run: python3 tests/test_dir_handle_leak.py bin/tnfsd
+      - name: Test handle bounds
+        run: python3 tests/test_handle_bounds.py bin/tnfsd
       - uses: actions/upload-artifact@master
         with:
           name: tnfsd_linux-x64

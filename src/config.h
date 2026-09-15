@@ -48,6 +48,8 @@
 #define TCP_KA_INTVL 1  /* the time (in seconds) between individual keepalive probes */
 #define TCP_KA_COUNT 60 /* the maximum number of keepalive probes TCP should send before dropping the connection */
 #define TCP_SEND_TIMEOUT 30 /* max seconds a send() to a client may stall */
+#define TCP_ACCEPT_RESOURCE_BACKOFF_MS 100 /* Windows only: pause before retrying accept()
+                                              after socket-handle exhaustion */
 #define SESSION_SWEEP_INTERVAL 10 /* how often the main loop reaps timed-out sessions */
 #define ACCEPT_WARN_INTERVAL 10 /* minimum seconds between accept() failure warnings */
 

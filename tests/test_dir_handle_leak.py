@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Regression test: OPENDIR/CLOSEDIR must not leak directory descriptors.
+"""Regression test: OPENDIR must not leak directory descriptors.
 
 tnfs_closedir() used to clear the handle's 'open' flag without calling
 closedir(), and every reclaim path keys off 'loaded' -- which plain OPENDIR
 never sets.  Each OPENDIR therefore leaked one fd for the life of the process,
 reaching the default 1024 soft limit in roughly a day of normal browsing.
+
+Two halves: repeated OPENDIR/CLOSEDIR must not grow the descriptor count, and
+UMOUNT must release handles the client never closed.  Session teardown used to
+sweep only 'loaded' slots, so it walked straight past a plain OPENDIR handle.
 """
 
 import os
@@ -18,8 +22,10 @@ from pathlib import Path
 HOST = "127.0.0.1"
 ANY_ADDRESS = "0.0.0.0"
 CYCLES = 300
+MAX_DHND_PER_CONN = 8  # config.h
 
 TNFS_MOUNT = 0x00
+TNFS_UMOUNT = 0x01
 TNFS_OPENDIR = 0x10
 TNFS_CLOSEDIR = 0x12
 PROTOVERSION = b"\x03\x01"
@@ -74,6 +80,16 @@ def request(client, address, sid, seqno, command, payload=b""):
 
 def open_fd_count(pid):
     return len(os.listdir(f"/proc/{pid}/fd"))
+
+
+def wait_for_fd_count(pid, expected, timeout=1.0):
+    """Teardown happens after the reply is sent, so give it a moment to settle."""
+    deadline = time.monotonic() + timeout
+    count = open_fd_count(pid)
+    while count != expected and time.monotonic() < deadline:
+        time.sleep(0.01)
+        count = open_fd_count(pid)
+    return count
 
 
 def main():
@@ -132,6 +148,33 @@ def main():
                     raise AssertionError(
                         f"leaked {growth} descriptors over {CYCLES} cycles"
                     )
+
+                # Now leave every handle open and tear the session down.
+                # tnfs_freesession() has to release plain OPENDIR handles too;
+                # keying the sweep off 'loaded' alone used to skip them.
+                for _ in range(MAX_DHND_PER_CONN):
+                    request(client, address, sid, seqno, TNFS_OPENDIR, b"/subdir\x00")
+                    seqno = (seqno + 1) & 0xFF
+
+                with_handles = open_fd_count(server.pid)
+                if with_handles != baseline + MAX_DHND_PER_CONN:
+                    raise AssertionError(
+                        f"expected {MAX_DHND_PER_CONN} open directory descriptors, "
+                        f"got {with_handles - baseline} "
+                        f"(baseline={baseline}, with_handles={with_handles})"
+                    )
+
+                request(client, address, sid, seqno, TNFS_UMOUNT)
+                after_umount = wait_for_fd_count(server.pid, baseline)
+                print(
+                    f"open fds: {MAX_DHND_PER_CONN} handles left open={with_handles}, "
+                    f"after UMOUNT={after_umount} (baseline={baseline})"
+                )
+                if after_umount != baseline:
+                    raise AssertionError(
+                        f"UMOUNT left {after_umount - baseline} directory descriptors "
+                        f"behind (baseline={baseline}, after_umount={after_umount})"
+                    )
         finally:
             if server.poll() is None:
                 server.terminate()
@@ -141,7 +184,7 @@ def main():
                     server.kill()
                     server.wait(timeout=3)
 
-    print("PASS: no descriptor growth")
+    print("PASS: no descriptor growth, and UMOUNT released every handle")
     return 0
 
 
