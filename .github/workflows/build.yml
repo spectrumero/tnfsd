@@ -1,13 +1,15 @@
-on: [push]
-
 name: tnfsd Build
+
+on:
+  push:
+  workflow_dispatch:
 
 jobs:
   build-windows:
     runs-on: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Install xa
         shell: powershell
         run: |
@@ -15,8 +17,9 @@ jobs:
           Copy-Item "C:\msys64\mingw64\bin\xa.exe" -Destination "C:\Windows\System32\xa.exe"
       - name: Build tnfsd
         shell: cmd
-        run: cd /d D:\a\tnfsd\tnfsd\src && make OS=Windows_NT DEBUG=yes USAGELOG=yes
-      - uses: actions/upload-artifact@master
+        working-directory: src
+        run: make OS=Windows_NT DEBUG=yes USAGELOG=yes
+      - uses: actions/upload-artifact@v4
         with:
           name: tnfsd_win-x64
           path: bin/tnfsd.exe
@@ -25,13 +28,14 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y xa65
       - name: Test chroot build configuration
         run: python3 tests/test_make_chroot.py
       - name: Build tnfsd
-        run: cd /home/runner/work/tnfsd/tnfsd/src && make OS=LINUX DEBUG=yes USAGELOG=yes
+        working-directory: src
+        run: make OS=LINUX DEBUG=yes USAGELOG=yes
       - name: Test queued UDP datagrams
         run: python3 tests/test_udp_burst.py bin/tnfsd
       - name: Test directory handle leak
@@ -44,35 +48,66 @@ jobs:
         run: python3 tests/test_confinement.py bin/tnfsd
       - name: Test read-only mode
         run: python3 tests/test_readonly.py bin/tnfsd
-      - uses: actions/upload-artifact@master
+      - uses: actions/upload-artifact@v4
         with:
           name: tnfsd_linux-x64
           path: bin/tnfsd
 
-  build-macos-arm64:
+  build-macos:
     runs-on: macos-latest
+    strategy:
+      matrix:
+        include:
+          - arch: arm64
+            archflag: arm64
+          - arch: x64
+            archflag: x86_64
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Install dependencies
         run: brew install xa
       - name: Build tnfsd
-        run: cd /Users/runner/work/tnfsd/tnfsd/src && make OS=BSD DEBUG=yes USAGELOG=yes
-      - uses: actions/upload-artifact@master
+        working-directory: src
+        run: make OS=BSD DEBUG=yes USAGELOG=yes CC="clang -arch ${{ matrix.archflag }}"
+      - name: Verify architecture
+        run: |
+          file bin/tnfsd
+          lipo -archs bin/tnfsd | grep -qw "${{ matrix.archflag }}"
+      - uses: actions/upload-artifact@v4
         with:
-          name: tnfsd_macos-arm64
+          name: tnfsd_macos-${{ matrix.arch }}
           path: bin/tnfsd
 
-  build-macos-x64:
-    runs-on: macos-13
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-windows, build-ubuntu, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Install dependencies
-        run: brew install xa
-      - name: Build tnfsd
-        run: cd /Users/runner/work/tnfsd/tnfsd/src && make OS=BSD DEBUG=yes USAGELOG=yes
-      - uses: actions/upload-artifact@master
+      - name: Download build artifacts
+        uses: actions/download-artifact@v5
         with:
-          name: tnfsd_macos-x64
-          path: bin/tnfsd
+          path: artifacts
+      - name: Package release zips
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for dir in artifacts/tnfsd_*/; do
+            platform="$(basename "$dir")"
+            platform="${platform#tnfsd_}"
+            chmod 755 "$dir"*
+            (cd "$dir" && zip -X -j "$GITHUB_WORKSPACE/dist/tnfsd-${GITHUB_REF_NAME}_${platform}.zip" ./*)
+          done
+          ls -l dist
+      - name: Publish to release
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          gh release view "$tag" >/dev/null 2>&1 \
+            || gh release create "$tag" --title "tnfsd $tag" --generate-notes
+          gh release upload "$tag" dist/*.zip --clobber
