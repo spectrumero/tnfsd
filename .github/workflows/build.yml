@@ -38,6 +38,12 @@ jobs:
         run: python3 tests/test_dir_handle_leak.py bin/tnfsd
       - name: Test handle bounds
         run: python3 tests/test_handle_bounds.py bin/tnfsd
+      - name: Test malformed requests
+        run: python3 tests/test_malformed_requests.py bin/tnfsd
+      - name: Test root confinement
+        run: python3 tests/test_confinement.py bin/tnfsd
+      - name: Test read-only mode
+        run: python3 tests/test_readonly.py bin/tnfsd
       - uses: actions/upload-artifact@master
         with:
           name: tnfsd_linux-x64

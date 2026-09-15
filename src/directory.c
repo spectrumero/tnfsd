@@ -181,10 +181,16 @@ int tnfs_setroot(const char *rootdir)
 	if (strlen(rootdir) > MAX_ROOT)
 		return -1;
 
+	/* realroot is what validate_path() compares every listing against. If
+	 * it cannot be resolved it stays indeterminate and every confinement
+	 * check runs against garbage, so refuse to start instead. tnfsd.c
+	 * already reports a -1 here as "Invalid root directory". */
 #ifdef WIN32
-	GetFullPathNameA(rootdir, MAX_ROOT, realroot, NULL);
+	if (GetFullPathNameA(rootdir, MAX_ROOT, realroot, NULL) == 0)
+		return -1;
 #else
-	realpath(rootdir, realroot);
+	if (realpath(rootdir, realroot) == NULL)
+		return -1;
 #endif
 
 	strlcpy(root, rootdir, MAX_ROOT);
@@ -288,10 +294,15 @@ int validate_path(Session *s, const char *path)
 #else
 	char valpath[MAX_FILEPATH];
 
+	/* On failure valpath is left indeterminate, so the strstr() below would
+	 * run over uninitialized stack and could match by accident. Treat an
+	 * unresolvable path as outside the root. */
 #ifdef WIN32
-	GetFullPathNameA(path, MAX_FILEPATH, valpath, NULL);
+	if (GetFullPathNameA(path, MAX_FILEPATH, valpath, NULL) == 0)
+		return 0;
 #else
-	realpath(path, valpath);
+	if (realpath(path, valpath) == NULL)
+		return 0;
 #endif
 
 #ifdef DEBUG
@@ -770,6 +781,10 @@ void tnfs_readdirx(Header *hdr, Session *s, unsigned char *databuf, int datasz)
 #endif
 		hdr->status = TNFS_EOF;
 		tnfs_send(s, hdr, NULL, 0);
+		/* Without this the EOF reply is followed by a second, built reply
+		 * for the same request: two datagrams for one seqno, which desyncs
+		 * the client and overwrites the retransmit buffer. */
+		return;
 	}
 
 #ifdef DEBUG
@@ -963,7 +978,10 @@ int _load_directory(dir_handle *dirh, uint8_t diropts, uint8_t sortopts, uint16_
 		// Try to stat the file before we can decide on other things
 		fileinfo_t finf;
 		snprintf(temp_statpath, sizeof(temp_statpath), "%s%c%s", dirh->path, FILEINFO_PATHSEPARATOR, entry->d_name);
-		strncpy(statpath, temp_statpath, sizeof(statpath));
+		/* temp_statpath is twice the size of statpath, so a long enough
+		 * dir + entry name leaves strncpy's copy unterminated and the
+		 * stat() below reads off the end of the buffer. */
+		strlcpy(statpath, temp_statpath, sizeof(statpath));
 		if (get_fileinfo(statpath, &finf) == 0)
 		{
 			/* If it's not a directory and we have a pattern that this doesn't match, skip it

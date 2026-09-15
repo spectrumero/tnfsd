@@ -31,6 +31,10 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
+#ifdef WIN32
+#include <process.h>
+#endif
 
 #include "session.h"
 #include "log.h"
@@ -50,9 +54,16 @@ void tnfs_init()
 	for (i = 0; i < MAX_SESSIONS; i++)
 		slist[i] = NULL;
 
+	/* tnfs_newsid() draws session IDs from this PRNG, and sessions are
+	 * authenticated by client IP alone. Outside BSD the seed was never set,
+	 * so rand() replayed one sequence and every restart handed out the same
+	 * first SID (0x4567), making it trivially guessable. */
 #ifdef BSD
-	/* initialize prng */
 	srandomdev();
+#elif defined(WIN32)
+	srand((unsigned)(time(NULL) ^ _getpid()));
+#else
+	srand((unsigned)(time(NULL) ^ getpid()));
 #endif
 }
 

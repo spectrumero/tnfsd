@@ -64,8 +64,27 @@ void tnfs_open_deprecated(Header *hdr, Session *s, unsigned char *buf,
 {
 	unsigned char *bufptr;
 
+	/* The deprecated layout is flags(1) + mode(1) + filename, so the
+	 * smallest legal datagram carries two header bytes and a filename of
+	 * at least its NUL terminator. Below that the memcpy() length
+	 * (bufsz - 2) goes negative and converts to a huge size_t, and the
+	 * daemon dies on a four-byte packet. */
+	if (bufsz < 3)
+	{
+		hdr->status = TNFS_EINVAL;
+		tnfs_send(s, hdr, NULL, 0);
+		return;
+	}
+
 	// new format datagram is slightly larger than the deprecated one.
 	unsigned char *newbuf = (unsigned char *)malloc(bufsz + 2);
+
+	if (newbuf == NULL)
+	{
+		hdr->status = TNFS_ENOMEM;
+		tnfs_send(s, hdr, NULL, 0);
+		return;
+	}
 
 	// translate deprecated file flags and mode
 	*newbuf = *buf;
@@ -91,7 +110,10 @@ void tnfs_open(Header *hdr, Session *s, unsigned char *buf, int bufsz)
 	int flags, mode;
 	unsigned char reply[2];
 
-	if (bufsz < 3 ||
+	/* flags(2) + mode(2) + a filename of at least its NUL terminator.
+	 * The old bound of 3 let mode read past the received bytes and handed
+	 * tnfs_valid_filename() a negative length. */
+	if (bufsz < 5 ||
 		tnfs_valid_filename(s, fnbuf, (char *)buf + 4, bufsz - 4) < 0)
 	{
 		/* filename could not be constructed */
@@ -223,6 +245,16 @@ void tnfs_write(Header *hdr, Session *s, unsigned char *buf, int bufsz)
 		return;
 
 	writesz = tnfs16uint(buf + 1);
+	/* The client's declared size is not evidence that it sent that many
+	 * bytes. buf points into the 532-byte receive buffer, so an unclamped
+	 * claim of up to 65535 makes write() copy tens of kilobytes of stack --
+	 * return addresses and heap pointers included -- into a file the client
+	 * can then read back. Write only what actually arrived and report that
+	 * count; a short write is a legal WRITEBLOCK reply. */
+	if (writesz > bufsz - 3)
+		writesz = bufsz - 3;
+	if (writesz > MAX_IOSZ)
+		writesz = MAX_IOSZ;
 	writesz = write(fd, buf + 3, (size_t)writesz);
 	if (writesz > 0)
 	{
