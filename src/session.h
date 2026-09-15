@@ -47,6 +47,8 @@ void tnfs_freesession(Session *s, int sindex);
 Session *tnfs_findsession_sid(uint16_t sid, int *sindex);
 Session *tnfs_findsession_ipaddr(in_addr_t ipaddr, int *sindex);
 void tnfs_reset_cli_fd_in_sessions(int cli_fd);
+bool tnfs_session_expired(Session *s, time_t currenttime);
+void tnfs_expire_sessions();
 uint16_t tnfs_newsid();
 uint16_t tnfs_session_count();
 void tnfs_free_all_sessions();

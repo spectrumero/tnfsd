@@ -34,6 +34,11 @@ bool tnfs_event_register(int fd)
     {
         if (event_fd_list[i] == 0)
         {
+            if (fd >= FD_SETSIZE)
+            {
+                LOG("tnfs_event_register: fd %d exceeds FD_SETSIZE\n", fd);
+                return false;
+            }
             event_fd_list[i] = fd;
             return true;
         }
@@ -66,17 +71,19 @@ event_wait_res_t* tnfs_event_wait(int timeout_sec)
     FD_COPY(&fdset, &errfdset);
 
     select_timeout.tv_sec = timeout_sec;
+    select_timeout.tv_usec = 0; /* select() writes back the remaining time */
 
     int readyfds = select(FD_SETSIZE, &fdset, NULL, &errfdset, &select_timeout);
 
-    wait_result.size = readyfds;
-    memset(wait_result.fds, 0, _EVENT_MAX_FDS * sizeof(int));
-
+    /* Return before memset so errno still describes the failure. */
     if (readyfds == SOCKET_ERROR)
     {
         wait_result.size = SOCKET_ERROR;
         return &wait_result;
     }
+
+    wait_result.size = readyfds;
+    memset(wait_result.fds, 0, _EVENT_MAX_FDS * sizeof(int));
 
     if (readyfds > 0)
     {

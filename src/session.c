@@ -235,7 +235,9 @@ void tnfs_freesession(Session *s, int sindex)
 	}
 	for (i = 0; i < MAX_DHND_PER_CONN; i++)
 	{
-		if (s->dhandles[i].loaded)
+		/* 'loaded' alone skipped plain OPENDIR handles, leaking their fds. */
+		if (s->dhandles[i].loaded || s->dhandles[i].open ||
+			s->dhandles[i].handle != NULL)
 			_tnfs_free_dir_handle(&s->dhandles[i]);
 	}
 	free(s);
@@ -275,8 +277,8 @@ Session *tnfs_findsession_ipaddr(in_addr_t ipaddr, int *sindex)
 	Session *s;
 	time_t currenttime;
 
-	Session *first_match_sess;
-	int first_match_idx;
+	Session *first_match_sess = NULL;
+	int first_match_idx = -1;
 
 	int count = 0;
 
@@ -294,19 +296,17 @@ Session *tnfs_findsession_ipaddr(in_addr_t ipaddr, int *sindex)
 			s = slist[i];
 
 			/* Remove expired sessions while we're looking at them all */
-			if(SESSION_TIMEOUT > 0 &&
-				(currenttime - s->last_contact >= SESSION_TIMEOUT) &&
-				s->cli_fd == 0)
+			if (tnfs_session_expired(s, currenttime))
 			{
 				LOG("Deleting expired session 0x%02x\n", s->sid);
 				tnfs_freesession(s, i);
 				continue;
 			}
-			
+
 			if (s->ipaddr == ipaddr)
 			{
 				// If we've reached the max for this IP, return the first match
-				if ((count + 1) >= MAX_SESSIONS_PER_IP)
+				if ((count + 1) >= MAX_SESSIONS_PER_IP && first_match_sess != NULL)
 				{
 					LOG("Found we already %d sessions for this IP - returning oldest entry\n", MAX_SESSIONS_PER_IP);
 					*sindex = first_match_idx;
@@ -322,6 +322,32 @@ Session *tnfs_findsession_ipaddr(in_addr_t ipaddr, int *sindex)
 		}
 	}
 	return NULL;
+}
+
+/* Sessions on a live TCP connection are exempt; tnfs_close_stale_connections()
+ * clears cli_fd first, making them eligible on a later pass. */
+bool tnfs_session_expired(Session *s, time_t currenttime)
+{
+	return SESSION_TIMEOUT > 0 &&
+		   (currenttime - s->last_contact >= SESSION_TIMEOUT) &&
+		   s->cli_fd == 0;
+}
+
+/* Reap timed-out sessions. Expiry was previously reachable only via
+ * tnfs_mount(), so an idle server never released a dead client's fds. */
+void tnfs_expire_sessions()
+{
+	time_t currenttime = time(NULL);
+	int i;
+
+	for (i = 0; i < MAX_SESSIONS; i++)
+	{
+		if (slist[i] && tnfs_session_expired(slist[i], currenttime))
+		{
+			LOG("Deleting expired session 0x%02x\n", slist[i]->sid);
+			tnfs_freesession(slist[i], i);
+		}
+	}
 }
 
 void tnfs_reset_cli_fd_in_sessions(int cli_fd)

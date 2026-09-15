@@ -46,14 +46,16 @@ event_wait_res_t* tnfs_event_wait(int timeout_sec)
 {
     int readyfds = epoll_wait(epfd, events, _EVENT_MAX_FDS, timeout_sec * 1000);
 
-    wait_result.size = readyfds;
-    memset(wait_result.fds, 0, _EVENT_MAX_FDS * sizeof(int));
-
+    /* Return before memset so errno still describes the failure (the caller
+     * needs to tell EINTR from a real error). */
     if (readyfds == -1)
     {
         wait_result.size = -1;
         return &wait_result;
     }
+
+    wait_result.size = readyfds;
+    memset(wait_result.fds, 0, _EVENT_MAX_FDS * sizeof(int));
 
     for (int i = 0; i < readyfds; i++)
     {

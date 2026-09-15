@@ -294,21 +294,26 @@ void tnfs_close(Header *hdr, Session *s, unsigned char *buf, int bufsz)
 	if (!fd)
 		return;
 
-	if (close(fd) == 0)
-	{
-		/* Clear Atari metadata if present */
-		if (atari_is_enabled())
-		{
-			atari_clear_fd(s, *buf);
-		}
+	int closed = close(fd);
+	int closed_errno = errno;
 
-		s->fd[*buf] = 0; /* clear the session's descriptor */
+	/* Release the slot either way: on failure (EINTR) the kernel has already
+	 * dropped the fd, and leaving it set means teardown closes that number a
+	 * second time -- by then it may name a live socket. */
+	if (atari_is_enabled())
+	{
+		atari_clear_fd(s, *buf);
+	}
+	s->fd[*buf] = 0;
+
+	if (closed == 0)
+	{
 		hdr->status = TNFS_SUCCESS;
 		tnfs_send(s, hdr, NULL, 0);
 	}
 	else
 	{
-		hdr->status = tnfs_error(errno);
+		hdr->status = tnfs_error(closed_errno);
 		tnfs_send(s, hdr, NULL, 0);
 	}
 }
@@ -591,7 +596,7 @@ int validate_fd(Header *hdr, Session *s, unsigned char *buf, int bufsz,
 				int propersize)
 {
 	if (bufsz < propersize ||
-		*buf > MAX_FD_PER_CONN ||
+		*buf >= MAX_FD_PER_CONN ||
 		s->fd[*buf] == 0)
 	{
 #ifdef DEBUG

@@ -34,6 +34,7 @@ TNFS daemon datagram handler
 #include <time.h>
 
 #ifdef UNIX
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -57,6 +58,18 @@ TNFS daemon datagram handler
 
 int sockfd;			/* UDP global socket file descriptor */
 int tcplistenfd;	/* TCP listening socket file descriptor */
+
+/* Set by tnfsd_stop(). The loop used to exit only because a signal made
+ * tnfs_event_wait() fail, which is indistinguishable from a real error. */
+volatile sig_atomic_t tnfs_stop_requested = 0;
+
+/* File scope so tnfs_send() can flag a connection whose peer stopped reading. */
+static TcpConnection tcpsocks[MAX_TCP_CONN];
+
+#ifndef WIN32
+/* Held only so an EMFILE is recoverable -- see tcp_accept(). */
+static int accept_reserve_fd = -1;
+#endif
 bool write_support; /* Whether writes should be enabled. */
 
 tnfs_cmdfunc dircmd[NUM_DIRCMDS] =
@@ -228,6 +241,10 @@ int tnfs_sockinit(int port)
 		return -1;
 	}
 	listen(tcplistenfd, 5);
+
+#ifndef WIN32
+	accept_reserve_fd = open("/dev/null", O_RDONLY);
+#endif
 	return 0;
 }
 
@@ -245,8 +262,8 @@ void tnfs_sockclose()
 void tnfs_mainloop()
 {
 	int i;
-	TcpConnection tcpsocks[MAX_TCP_CONN];
 	time_t last_stats_report = 0;
+	time_t last_session_sweep = 0;
 	time_t now = 0;
 
 	memset(&tcpsocks, 0, sizeof(tcpsocks));
@@ -255,13 +272,29 @@ void tnfs_mainloop()
 	tnfs_event_register(sockfd);
 	tnfs_event_register(tcplistenfd);
 
-	while (true)
+	while (!tnfs_stop_requested)
 	{
+		time(&now);
+
 		tnfs_close_stale_connections(tcpsocks);
+
+		/* Must run on a timer: expiry was reachable only via tnfs_mount(), so
+		 * an idle server never released a dead client's fds. */
+		if (now - last_session_sweep >= SESSION_SWEEP_INTERVAL)
+		{
+			tnfs_expire_sessions();
+			last_session_sweep = now;
+		}
 
 		event_wait_res_t *wait_res = tnfs_event_wait(1);
 		if (wait_res->size == SOCKET_ERROR)
 		{
+#ifndef WIN32
+			/* A delivered signal is not a failure; this used to exit(0). */
+			if (errno == EINTR)
+				continue;
+#endif
+			LOG("event wait failed: %s\n", strerror(errno));
 			break;
 		}
 
@@ -354,8 +387,93 @@ static void apply_keepalive_options(int fd)
 		LOG("setsockopt(TCP_KEEPCNT) failed on accepted socket: %s\n", strerror(errno));
 	}
 #endif
+
+	/* Keep-alive only covers idle connections. A peer that stalls with a full
+	 * receive window is handled by the persist timer, which probes forever --
+	 * so a blocking send() would hang the whole single-threaded server. Bound
+	 * it at both the kernel and the syscall. */
+#ifdef TCP_USER_TIMEOUT
+	int user_timeout = (TCP_KA_IDLE + TCP_KA_INTVL * TCP_KA_COUNT) * 1000;
+	if (setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout, sizeof(user_timeout)) < 0)
+	{
+		LOG("setsockopt(TCP_USER_TIMEOUT) failed on accepted socket: %s\n", strerror(errno));
+	}
+#endif
+
+	struct timeval sndtimeo;
+	sndtimeo.tv_sec = TCP_SEND_TIMEOUT;
+	sndtimeo.tv_usec = 0;
+	if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &sndtimeo, sizeof(sndtimeo)) < 0)
+	{
+		LOG("setsockopt(SO_SNDTIMEO) failed on accepted socket: %s\n", strerror(errno));
+	}
 }
 #endif /* !WIN32 */
+
+#ifndef WIN32
+/* epoll is level-triggered, so a connection left on the accept queue keeps
+ * tcplistenfd readable and the loop spins at 100% CPU, one log line per pass --
+ * enough to block on a slow log sink and take UDP down too. Free the reserve fd,
+ * use the slot to accept and drop the pending connection, then take it back. */
+static void tcp_accept_drain_reserve(void)
+{
+	int fd;
+
+	if (accept_reserve_fd < 0)
+		return;
+
+	close(accept_reserve_fd);
+	accept_reserve_fd = -1;
+
+	fd = accept(tcplistenfd, NULL, NULL);
+	if (fd >= 0)
+		close(fd);
+
+	accept_reserve_fd = open("/dev/null", O_RDONLY);
+}
+#endif
+
+/* Under fd exhaustion this fires on every pass of the loop, so rate-limit it. */
+static void tcp_accept_warn(int err)
+{
+	static time_t last_warn = 0;
+	static unsigned long suppressed = 0;
+	time_t now = time(NULL);
+
+	if (now - last_warn < ACCEPT_WARN_INTERVAL)
+	{
+		suppressed++;
+		return;
+	}
+
+	if (suppressed > 0)
+		LOG("unable to accept TCP connection: %s (%lu more suppressed)\n",
+			strerror(err), suppressed);
+	else
+		LOG("unable to accept TCP connection: %s\n", strerror(err));
+
+	last_warn = now;
+	suppressed = 0;
+}
+
+/* Mark a connection dead so tnfs_close_stale_connections() reaps it next pass.
+ * Closing it here would leave a dangling fd in the caller's scan. */
+static void tnfs_mark_tcp_dead(int cli_fd)
+{
+	int i;
+
+	if (cli_fd == 0)
+		return;
+
+	for (i = 0; i < MAX_TCP_CONN; i++)
+	{
+		if (tcpsocks[i].cli_fd == cli_fd)
+		{
+			tcpsocks[i].last_contact = 0;
+			return;
+		}
+	}
+}
 
 void tcp_accept(TcpConnection *tcp_conn_list)
 {
@@ -369,15 +487,38 @@ void tcp_accept(TcpConnection *tcp_conn_list)
 #endif
 
 	TcpConnection *tcp_conn;
-	LOG("tcp_accept - accepting connection\n");
 
 	acc_fd = accept(tcplistenfd, (struct sockaddr *)&cliaddr, &cli_len);
 
-	if (acc_fd < 1)
+	if (acc_fd < 0)
 	{
-		fprintf(stderr, "WARNING: unable to accept TCP connection: %s\n", strerror(errno));
+#ifndef WIN32
+		switch (errno)
+		{
+		case EINTR:
+		case EAGAIN:
+#if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
+		case EWOULDBLOCK:
+#endif
+		case ECONNABORTED:
+			/* transient; client went away mid-handshake */
+			return;
+		case EMFILE:
+		case ENFILE:
+		case ENOBUFS:
+		case ENOMEM:
+			tcp_accept_warn(errno);
+			tcp_accept_drain_reserve();
+			return;
+		default:
+			break;
+		}
+#endif
+		tcp_accept_warn(errno);
 		return;
 	}
+
+	LOG("tcp_accept - accepted connection on fd %d\n", acc_fd);
 
 #ifndef WIN32
 	/* Apply per-connection keep-alive options.  See comment in
@@ -687,9 +828,16 @@ void tnfs_send(Session *sess, Header *hdr, unsigned char *msg, int msgsz)
 		txbytes = send(hdr->cli_fd, WIN32_CHAR_P txbuf, msgsz + TNFS_HEADERSZ + 1, 0);
 	}
 
-	if (txbytes < TNFS_HEADERSZ + 1 + msgsz)
+	if (txbytes < 0)
 	{
+		TNFSMSGLOG(hdr, "Send failed: %s", strerror(errno));
+		tnfs_mark_tcp_dead(hdr->cli_fd);
+	}
+	else if (txbytes < TNFS_HEADERSZ + 1 + msgsz)
+	{
+		/* A short write desynchronises the TCP stream; drop the connection. */
 		TNFSMSGLOG(hdr, "Message was truncated");
+		tnfs_mark_tcp_dead(hdr->cli_fd);
 	}
 }
 
@@ -709,6 +857,7 @@ void tnfs_resend(Session *sess, struct sockaddr_in *cliaddr, int cli_fd)
 	{
 		MSGLOG(cliaddr->sin_addr.s_addr,
 			   "Retransmit was truncated");
+		tnfs_mark_tcp_dead(cli_fd);
 	}
 }
 
@@ -739,5 +888,6 @@ void tnfs_close_all_connections(TcpConnection *tcp_conn_list)
 		{
 			tnfs_close_tcp(tcp_conn);
 		}
+		tcp_conn++;
 	}
 }
