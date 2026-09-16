@@ -34,6 +34,7 @@ TNFS daemon datagram handler
 #include <time.h>
 
 #ifdef UNIX
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -57,6 +58,18 @@ TNFS daemon datagram handler
 
 int sockfd;			/* UDP global socket file descriptor */
 int tcplistenfd;	/* TCP listening socket file descriptor */
+
+/* Set by tnfsd_stop(). The loop used to exit only because a signal made
+ * tnfs_event_wait() fail, which is indistinguishable from a real error. */
+volatile sig_atomic_t tnfs_stop_requested = 0;
+
+/* File scope so tnfs_send() can flag a connection whose peer stopped reading. */
+static TcpConnection tcpsocks[MAX_TCP_CONN];
+
+#ifndef WIN32
+/* Held only so an EMFILE is recoverable -- see tcp_accept(). */
+static int accept_reserve_fd = -1;
+#endif
 bool write_support; /* Whether writes should be enabled. */
 
 tnfs_cmdfunc dircmd[NUM_DIRCMDS] =
@@ -188,55 +201,29 @@ int tnfs_sockinit(int port)
 		return -1;
 	}
 
-#ifndef WIN32
-	/* enables sending of keep-alive messages */
-	int ka_enable = 1;
-	if (setsockopt(tcplistenfd, SOL_SOCKET, SO_KEEPALIVE, &ka_enable, sizeof(ka_enable)) < 0)
-	{
-		LOG("setsockopt(SO_KEEPALIVE) failed");
-		tnfs_sockclose();
-		return -1;
-	}
-	int ka_idle = TCP_KA_IDLE;
-#if defined(TCP_KEEPIDLE)
-	if (setsockopt(tcplistenfd, IPPROTO_TCP, TCP_KEEPIDLE, &ka_idle, sizeof(ka_idle)) < 0)
-	{
-		LOG("setsockopt(TCP_KEEPIDLE) failed");
-		tnfs_sockclose();
-		return -1;
-	}
-#elif defined(TCP_KEEPALIVE)
-	/* macOS/BSD use TCP_KEEPALIVE to set the idle time (seconds) */
-	if (setsockopt(tcplistenfd, IPPROTO_TCP, TCP_KEEPALIVE, &ka_idle, sizeof(ka_idle)) < 0)
-	{
-		LOG("setsockopt(TCP_KEEPALIVE) failed");
-		tnfs_sockclose();
-		return -1;
-	}
-#else
-	/* no platform support for setting idle timeout; continue */
-#endif
-	/* the time (in seconds) between individual keepalive probes */
-	int ka_interval = TCP_KA_INTVL;
-#ifdef TCP_KEEPINTVL
-	if (setsockopt(tcplistenfd, IPPROTO_TCP, TCP_KEEPINTVL, &ka_interval, sizeof(ka_interval)) < 0)
-	{
-		LOG("setsockopt(TCP_KEEPINTVL) failed");
-		tnfs_sockclose();
-		return -1;
-	}
-#endif
-	/* the maximum number of keepalive probes TCP should send before dropping the connection */
-	int ka_count = TCP_KA_COUNT;
-#ifdef TCP_KEEPCNT
-	if (setsockopt(tcplistenfd, IPPROTO_TCP, TCP_KEEPCNT, &ka_count, sizeof(ka_count)) < 0)
-	{
-		LOG("setsockopt(TCP_KEEPCNT) failed");
-		tnfs_sockclose();
-		return -1;
-	}
-#endif
-#endif
+	/* Bug fix (2026-05-19): The TCP keep-alive socket options
+	 * (SO_KEEPALIVE, TCP_KEEPIDLE/TCP_KEEPALIVE, TCP_KEEPINTVL,
+	 * TCP_KEEPCNT) used to be applied to the listening socket here.
+	 *
+	 * That was non-portable behaviour:
+	 *   - On Linux these options are inherited by accepted connections
+	 *     and have no effect on the listen socket itself, so the code
+	 *     "worked".
+	 *   - On macOS / BSD enabling SO_KEEPALIVE on a listening socket
+	 *     causes the kernel to start sending TCP keep-alive probes on
+	 *     the listening socket itself.  A listen socket has no peer,
+	 *     so the probes go unanswered and after roughly
+	 *     TCP_KA_IDLE + TCP_KA_COUNT * TCP_KA_INTVL seconds the kernel
+	 *     reaps the socket.  Subsequent client SYNs are then rejected
+	 *     by the kernel with RST,ACK because nothing is listening on
+	 *     that port anymore (FujiNet would log
+	 *     errno 104 "Connection reset by peer" and fall back to UDP).
+	 *
+	 * The intent was always to set keep-alive defaults for accepted
+	 * client connections, so the options are now applied per-connection
+	 * in tcp_accept() via apply_keepalive_options() instead.  See that
+	 * function for the actual setsockopt() calls.
+	 */
 
 #ifndef WIN32
 	signal(SIGPIPE, SIG_IGN);
@@ -254,6 +241,10 @@ int tnfs_sockinit(int port)
 		return -1;
 	}
 	listen(tcplistenfd, 5);
+
+#ifndef WIN32
+	accept_reserve_fd = open("/dev/null", O_RDONLY);
+#endif
 	return 0;
 }
 
@@ -271,8 +262,8 @@ void tnfs_sockclose()
 void tnfs_mainloop()
 {
 	int i;
-	TcpConnection tcpsocks[MAX_TCP_CONN];
 	time_t last_stats_report = 0;
+	time_t last_session_sweep = 0;
 	time_t now = 0;
 
 	memset(&tcpsocks, 0, sizeof(tcpsocks));
@@ -281,13 +272,29 @@ void tnfs_mainloop()
 	tnfs_event_register(sockfd);
 	tnfs_event_register(tcplistenfd);
 
-	while (true)
+	while (!tnfs_stop_requested)
 	{
+		time(&now);
+
 		tnfs_close_stale_connections(tcpsocks);
+
+		/* Must run on a timer: expiry was reachable only via tnfs_mount(), so
+		 * an idle server never released a dead client's fds. */
+		if (now - last_session_sweep >= SESSION_SWEEP_INTERVAL)
+		{
+			tnfs_expire_sessions();
+			last_session_sweep = now;
+		}
 
 		event_wait_res_t *wait_res = tnfs_event_wait(1);
 		if (wait_res->size == SOCKET_ERROR)
 		{
+#ifndef WIN32
+			/* A delivered signal is not a failure; this used to exit(0). */
+			if (errno == EINTR)
+				continue;
+#endif
+			LOG("event wait failed: %s\n", strerror(errno));
 			break;
 		}
 
@@ -332,6 +339,156 @@ void tnfs_mainloop()
 	tnfs_free_all_sessions();
 }
 
+#ifndef WIN32
+/* Apply TCP keep-alive options to a freshly accepted client connection.
+ *
+ * These used to be applied to the listening socket in tnfs_sockinit(),
+ * which broke the listener on macOS/BSD (see comment there).  Each
+ * setsockopt failure here is logged but is not fatal -- a single client
+ * connection that cannot enable keep-alive is still usable, and the
+ * listener stays up to serve other clients.
+ */
+static void apply_keepalive_options(int fd)
+{
+	int ka_enable = 1;
+	if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &ka_enable, sizeof(ka_enable)) < 0)
+	{
+		LOG("setsockopt(SO_KEEPALIVE) failed on accepted socket: %s\n", strerror(errno));
+	}
+
+	int ka_idle = TCP_KA_IDLE;
+#if defined(TCP_KEEPIDLE)
+	if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &ka_idle, sizeof(ka_idle)) < 0)
+	{
+		LOG("setsockopt(TCP_KEEPIDLE) failed on accepted socket: %s\n", strerror(errno));
+	}
+#elif defined(TCP_KEEPALIVE)
+	/* macOS/BSD use TCP_KEEPALIVE to set the idle time (seconds) */
+	if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &ka_idle, sizeof(ka_idle)) < 0)
+	{
+		LOG("setsockopt(TCP_KEEPALIVE) failed on accepted socket: %s\n", strerror(errno));
+	}
+#else
+	/* no platform support for setting idle timeout; continue */
+#endif
+
+	int ka_interval = TCP_KA_INTVL;
+#ifdef TCP_KEEPINTVL
+	if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &ka_interval, sizeof(ka_interval)) < 0)
+	{
+		LOG("setsockopt(TCP_KEEPINTVL) failed on accepted socket: %s\n", strerror(errno));
+	}
+#endif
+
+	int ka_count = TCP_KA_COUNT;
+#ifdef TCP_KEEPCNT
+	if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &ka_count, sizeof(ka_count)) < 0)
+	{
+		LOG("setsockopt(TCP_KEEPCNT) failed on accepted socket: %s\n", strerror(errno));
+	}
+#endif
+
+	/* Keep-alive only covers idle connections. A peer that stalls with a full
+	 * receive window is handled by the persist timer, which probes forever --
+	 * so a blocking send() would hang the whole single-threaded server. Bound
+	 * it at both the kernel and the syscall. */
+#ifdef TCP_USER_TIMEOUT
+	int user_timeout = (TCP_KA_IDLE + TCP_KA_INTVL * TCP_KA_COUNT) * 1000;
+	if (setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout, sizeof(user_timeout)) < 0)
+	{
+		LOG("setsockopt(TCP_USER_TIMEOUT) failed on accepted socket: %s\n", strerror(errno));
+	}
+#endif
+
+	struct timeval sndtimeo;
+	sndtimeo.tv_sec = TCP_SEND_TIMEOUT;
+	sndtimeo.tv_usec = 0;
+	if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &sndtimeo, sizeof(sndtimeo)) < 0)
+	{
+		LOG("setsockopt(SO_SNDTIMEO) failed on accepted socket: %s\n", strerror(errno));
+	}
+}
+#endif /* !WIN32 */
+
+#ifndef WIN32
+/* epoll is level-triggered, so a connection left on the accept queue keeps
+ * tcplistenfd readable and the loop spins at 100% CPU, one log line per pass --
+ * enough to block on a slow log sink and take UDP down too. Free the reserve fd,
+ * use the slot to accept and drop the pending connection, then take it back. */
+static void tcp_accept_drain_reserve(void)
+{
+	int fd;
+
+	if (accept_reserve_fd < 0)
+		return;
+
+	close(accept_reserve_fd);
+	accept_reserve_fd = -1;
+
+	fd = accept(tcplistenfd, NULL, NULL);
+	if (fd >= 0)
+		close(fd);
+
+	accept_reserve_fd = open("/dev/null", O_RDONLY);
+}
+#endif
+
+/* Winsock reports through WSAGetLastError(), so errno is never set and
+ * strerror() would describe an error nothing raised. */
+static const char *tcp_accept_strerror(int err)
+{
+#ifdef WIN32
+	static char buf[32];
+
+	snprintf(buf, sizeof(buf), "WSA error %d", err);
+	return buf;
+#else
+	return strerror(err);
+#endif
+}
+
+/* Under fd exhaustion this fires on every pass of the loop, so rate-limit it. */
+static void tcp_accept_warn(int err)
+{
+	static time_t last_warn = 0;
+	static unsigned long suppressed = 0;
+	time_t now = time(NULL);
+
+	if (now - last_warn < ACCEPT_WARN_INTERVAL)
+	{
+		suppressed++;
+		return;
+	}
+
+	if (suppressed > 0)
+		LOG("unable to accept TCP connection: %s (%lu more suppressed)\n",
+			tcp_accept_strerror(err), suppressed);
+	else
+		LOG("unable to accept TCP connection: %s\n", tcp_accept_strerror(err));
+
+	last_warn = now;
+	suppressed = 0;
+}
+
+/* Mark a connection dead so tnfs_close_stale_connections() reaps it next pass.
+ * Closing it here would leave a dangling fd in the caller's scan. */
+static void tnfs_mark_tcp_dead(int cli_fd)
+{
+	int i;
+
+	if (cli_fd == 0)
+		return;
+
+	for (i = 0; i < MAX_TCP_CONN; i++)
+	{
+		if (tcpsocks[i].cli_fd == cli_fd)
+		{
+			tcpsocks[i].last_contact = 0;
+			return;
+		}
+	}
+}
+
 void tcp_accept(TcpConnection *tcp_conn_list)
 {
 	int acc_fd, i;
@@ -344,15 +501,58 @@ void tcp_accept(TcpConnection *tcp_conn_list)
 #endif
 
 	TcpConnection *tcp_conn;
-	LOG("tcp_accept - accepting connection\n");
 
 	acc_fd = accept(tcplistenfd, (struct sockaddr *)&cliaddr, &cli_len);
 
-	if (acc_fd < 1)
+	/* accept() yields INVALID_SOCKET on Windows, which truncates to -1 here.
+	 * Don't compare against INVALID_SOCKET directly: it is unsigned and wider
+	 * than int on 64-bit, so the comparison would never be true. */
+	if (acc_fd < 0)
 	{
-		fprintf(stderr, "WARNING: unable to accept TCP connection: %s\n", strerror(errno));
+#ifdef WIN32
+		int accept_error = WSAGetLastError();
+
+		tcp_accept_warn(accept_error);
+
+		/* No reserve-descriptor trick here, so simply stop spinning on a
+		 * listener that stays readable while the process is out of handles. */
+		if (accept_error == WSAEMFILE || accept_error == WSAENOBUFS)
+			Sleep(TCP_ACCEPT_RESOURCE_BACKOFF_MS);
+#else
+		switch (errno)
+		{
+		case EINTR:
+		case EAGAIN:
+#if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
+		case EWOULDBLOCK:
+#endif
+		case ECONNABORTED:
+			/* transient; client went away mid-handshake */
+			return;
+		case EMFILE:
+		case ENFILE:
+		case ENOBUFS:
+		case ENOMEM:
+			tcp_accept_warn(errno);
+			tcp_accept_drain_reserve();
+			return;
+		default:
+			break;
+		}
+
+		tcp_accept_warn(errno);
+#endif
 		return;
 	}
+
+	LOG("tcp_accept - accepted connection on fd %d\n", acc_fd);
+
+#ifndef WIN32
+	/* Apply per-connection keep-alive options.  See comment in
+	 * tnfs_sockinit() for why this is done here and not on the
+	 * listening socket. */
+	apply_keepalive_options(acc_fd);
+#endif
 
 	bool event_registered = false;
 	if (tnfs_event_register(acc_fd))
@@ -407,6 +607,23 @@ void tnfs_handle_udpmsg()
 	rxbytes = recvfrom(sockfd, (char *)rxbuf, sizeof(rxbuf), 0,
 					   (struct sockaddr *)&cliaddr, &len);
 
+#ifdef WIN32
+	if (rxbytes == SOCKET_ERROR)
+	{
+		LOG("recvfrom() failed: %d\n", WSAGetLastError());
+		return;
+	}
+#else
+	if (rxbytes < 0)
+	{
+		if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)
+		{
+			LOG("recvfrom() failed: %s\n", strerror(errno));
+		}
+		return;
+	}
+#endif
+
 	if (rxbytes >= TNFS_HEADERSZ)
 	{
 		/* probably a valid TNFS packet, decode it */
@@ -417,8 +634,6 @@ void tnfs_handle_udpmsg()
 		MSGLOG(cliaddr.sin_addr.s_addr,
 			   "Invalid datagram received");
 	}
-
-	*(rxbuf + rxbytes) = 0;
 }
 
 void tnfs_handle_tcpmsg(TcpConnection *tcp_conn)
@@ -512,8 +727,15 @@ void tnfs_decode(struct sockaddr_in *cliaddr, int cli_fd, int rxbytes, unsigned 
 		}
 		if (sess->cli_fd != 0 && sess->cli_fd != cli_fd)
 		{
-			TNFSMSGLOG(&hdr, "Session is assigned to another TCP connection");
-			return;
+			/* The same client (the IP was verified above) is reaching us on a
+			 * new connection while the session is still bound to a previous one.
+			 * This happens when the old connection went away without us seeing a
+			 * close -- e.g. a NAT/firewall dropped the idle path, so the client's
+			 * FIN never arrived and the old socket lingers as a zombie until
+			 * keepalive/CONN_TIMEOUT reaps it. Migrate the session to the new
+			 * connection instead of rejecting every request until then. */
+			TNFSMSGLOG(&hdr, "Migrating session from fd %d to new TCP connection fd %d",
+					   sess->cli_fd, cli_fd);
 		}
 		/* Update session timestamp */
 		sess->last_contact = time(NULL);
@@ -633,9 +855,16 @@ void tnfs_send(Session *sess, Header *hdr, unsigned char *msg, int msgsz)
 		txbytes = send(hdr->cli_fd, WIN32_CHAR_P txbuf, msgsz + TNFS_HEADERSZ + 1, 0);
 	}
 
-	if (txbytes < TNFS_HEADERSZ + 1 + msgsz)
+	if (txbytes < 0)
 	{
+		TNFSMSGLOG(hdr, "Send failed: %s", strerror(errno));
+		tnfs_mark_tcp_dead(hdr->cli_fd);
+	}
+	else if (txbytes < TNFS_HEADERSZ + 1 + msgsz)
+	{
+		/* A short write desynchronises the TCP stream; drop the connection. */
 		TNFSMSGLOG(hdr, "Message was truncated");
+		tnfs_mark_tcp_dead(hdr->cli_fd);
 	}
 }
 
@@ -655,6 +884,7 @@ void tnfs_resend(Session *sess, struct sockaddr_in *cliaddr, int cli_fd)
 	{
 		MSGLOG(cliaddr->sin_addr.s_addr,
 			   "Retransmit was truncated");
+		tnfs_mark_tcp_dead(cli_fd);
 	}
 }
 
@@ -685,5 +915,6 @@ void tnfs_close_all_connections(TcpConnection *tcp_conn_list)
 		{
 			tnfs_close_tcp(tcp_conn);
 		}
+		tcp_conn++;
 	}
 }

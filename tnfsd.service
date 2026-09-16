@@ -10,5 +10,8 @@ User=tnfs
 Group=tnfs
 ExecStart=/usr/local/sbin/tnfsd /tnfs
 
+# systemd's default soft limit is 1024; tnfsd needs far more.
+LimitNOFILE=65536
+
 [Install]
 WantedBy=multi-user.target

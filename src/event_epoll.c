@@ -21,7 +21,12 @@ void tnfs_event_init()
 bool tnfs_event_register(int fd)
 {
     struct epoll_event ev;
-    ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
+    /*
+     * Socket handlers consume one datagram, connection, or read per main-loop
+     * iteration. Use level-triggered notifications so descriptors remain
+     * ready while the kernel still has input queued for them.
+     */
+    ev.events = EPOLLIN | EPOLLRDHUP;
     ev.data.fd = fd;
 
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == -1)
@@ -41,14 +46,16 @@ event_wait_res_t* tnfs_event_wait(int timeout_sec)
 {
     int readyfds = epoll_wait(epfd, events, _EVENT_MAX_FDS, timeout_sec * 1000);
 
-    wait_result.size = readyfds;
-    memset(wait_result.fds, 0, _EVENT_MAX_FDS * sizeof(int));
-
+    /* Return before memset so errno still describes the failure (the caller
+     * needs to tell EINTR from a real error). */
     if (readyfds == -1)
     {
         wait_result.size = -1;
         return &wait_result;
     }
+
+    wait_result.size = readyfds;
+    memset(wait_result.fds, 0, _EVENT_MAX_FDS * sizeof(int));
 
     for (int i = 0; i < readyfds; i++)
     {

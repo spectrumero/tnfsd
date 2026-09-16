@@ -32,7 +32,9 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <stdio.h>
+#ifndef WIN32
 #include <sys/statvfs.h>
+#endif
 
 #ifdef UNIX
 #include <sys/uio.h>
@@ -62,8 +64,27 @@ void tnfs_open_deprecated(Header *hdr, Session *s, unsigned char *buf,
 {
 	unsigned char *bufptr;
 
+	/* The deprecated layout is flags(1) + mode(1) + filename, so the
+	 * smallest legal datagram carries two header bytes and a filename of
+	 * at least its NUL terminator. Below that the memcpy() length
+	 * (bufsz - 2) goes negative and converts to a huge size_t, and the
+	 * daemon dies on a four-byte packet. */
+	if (bufsz < 3)
+	{
+		hdr->status = TNFS_EINVAL;
+		tnfs_send(s, hdr, NULL, 0);
+		return;
+	}
+
 	// new format datagram is slightly larger than the deprecated one.
 	unsigned char *newbuf = (unsigned char *)malloc(bufsz + 2);
+
+	if (newbuf == NULL)
+	{
+		hdr->status = TNFS_ENOMEM;
+		tnfs_send(s, hdr, NULL, 0);
+		return;
+	}
 
 	// translate deprecated file flags and mode
 	*newbuf = *buf;
@@ -89,7 +110,10 @@ void tnfs_open(Header *hdr, Session *s, unsigned char *buf, int bufsz)
 	int flags, mode;
 	unsigned char reply[2];
 
-	if (bufsz < 3 ||
+	/* flags(2) + mode(2) + a filename of at least its NUL terminator.
+	 * The old bound of 3 let mode read past the received bytes and handed
+	 * tnfs_valid_filename() a negative length. */
+	if (bufsz < 5 ||
 		tnfs_valid_filename(s, fnbuf, (char *)buf + 4, bufsz - 4) < 0)
 	{
 		/* filename could not be constructed */
@@ -221,6 +245,16 @@ void tnfs_write(Header *hdr, Session *s, unsigned char *buf, int bufsz)
 		return;
 
 	writesz = tnfs16uint(buf + 1);
+	/* The client's declared size is not evidence that it sent that many
+	 * bytes. buf points into the 532-byte receive buffer, so an unclamped
+	 * claim of up to 65535 makes write() copy tens of kilobytes of stack --
+	 * return addresses and heap pointers included -- into a file the client
+	 * can then read back. Write only what actually arrived and report that
+	 * count; a short write is a legal WRITEBLOCK reply. */
+	if (writesz > bufsz - 3)
+		writesz = bufsz - 3;
+	if (writesz > MAX_IOSZ)
+		writesz = MAX_IOSZ;
 	writesz = write(fd, buf + 3, (size_t)writesz);
 	if (writesz > 0)
 	{
@@ -292,21 +326,26 @@ void tnfs_close(Header *hdr, Session *s, unsigned char *buf, int bufsz)
 	if (!fd)
 		return;
 
-	if (close(fd) == 0)
-	{
-		/* Clear Atari metadata if present */
-		if (atari_is_enabled())
-		{
-			atari_clear_fd(s, *buf);
-		}
+	int closed = close(fd);
+	int closed_errno = errno;
 
-		s->fd[*buf] = 0; /* clear the session's descriptor */
+	/* Release the slot either way: on failure (EINTR) the kernel has already
+	 * dropped the fd, and leaving it set means teardown closes that number a
+	 * second time -- by then it may name a live socket. */
+	if (atari_is_enabled())
+	{
+		atari_clear_fd(s, *buf);
+	}
+	s->fd[*buf] = 0;
+
+	if (closed == 0)
+	{
 		hdr->status = TNFS_SUCCESS;
 		tnfs_send(s, hdr, NULL, 0);
 	}
 	else
 	{
-		hdr->status = tnfs_error(errno);
+		hdr->status = tnfs_error(closed_errno);
 		tnfs_send(s, hdr, NULL, 0);
 	}
 }
@@ -437,15 +476,32 @@ void tnfs_rename(Header *hdr, Session *s, unsigned char *buf, int bufsz)
 
 void tnfs_size(Header *hdr, Session *s, unsigned char *buf, int bufsz)
 {
-	struct statvfs vfs;
+	uint64_t total_bytes = 0;
+	int ok = 0;
 
 	get_root(s, fnbuf, MAX_FILEPATH);
+
+#ifdef WIN32
+	ULARGE_INTEGER free_avail, total, total_free;
+	if (GetDiskFreeSpaceExA(fnbuf, &free_avail, &total, &total_free))
+	{
+		total_bytes = total.QuadPart;
+		ok = 1;
+	}
+#else
+	struct statvfs vfs;
 	if (statvfs(fnbuf, &vfs) == 0)
 	{
 		uint64_t block_size = (vfs.f_frsize ? vfs.f_frsize : vfs.f_bsize);
-		uint64_t total_bytes = (uint64_t)vfs.f_blocks * block_size;
+		total_bytes = (uint64_t)vfs.f_blocks * block_size;
+		ok = 1;
+	}
+#endif
+
+	if (ok)
+	{
 		hdr->status = TNFS_SUCCESS;
-		if ( hdr->cmd == TNFS_SIZEBYTESDEVICE )
+		if (hdr->cmd == TNFS_SIZEBYTESDEVICE)
 		{
 			unsigned char resp[8];
 			uint64tnfs(resp, total_bytes);
@@ -453,7 +509,6 @@ void tnfs_size(Header *hdr, Session *s, unsigned char *buf, int bufsz)
 		}
 		else
 		{
-			// Fallback to 32-bit size in KB
 			unsigned char resp[4];
 			uint64_t kb = (total_bytes / 1024ULL);
 			uint32tnfs(resp, (uint32_t)kb);
@@ -472,23 +527,39 @@ void tnfs_size(Header *hdr, Session *s, unsigned char *buf, int bufsz)
 
 void tnfs_free(Header *hdr, Session *s, unsigned char *buf, int bufsz)
 {
-	struct statvfs vfs;
+	uint64_t free_bytes = 0;
+	int ok = 0;
 
 	get_root(s, fnbuf, MAX_FILEPATH);
+
+#ifdef WIN32
+	ULARGE_INTEGER free_avail, total, total_free;
+	if (GetDiskFreeSpaceExA(fnbuf, &free_avail, &total, &total_free))
+	{
+		free_bytes = free_avail.QuadPart;
+		ok = 1;
+	}
+#else
+	struct statvfs vfs;
 	if (statvfs(fnbuf, &vfs) == 0)
 	{
 		uint64_t block_size = (vfs.f_frsize ? vfs.f_frsize : vfs.f_bsize);
-		uint64_t free_bytes = (uint64_t)vfs.f_bavail * block_size;
+		free_bytes = (uint64_t)vfs.f_bavail * block_size;
+		ok = 1;
+	}
+#endif
+
+	if (ok)
+	{
 		hdr->status = TNFS_SUCCESS;
-		if ( hdr->cmd == TNFS_FREEBYTESDEVICE )
-				{
+		if (hdr->cmd == TNFS_FREEBYTESDEVICE)
+		{
 			unsigned char resp[8];
 			uint64tnfs(resp, free_bytes);
 			tnfs_send(s, hdr, resp, sizeof(resp));
 		}
 		else
 		{
-			// Fallback to 32-bit size in KB
 			unsigned char resp[4];
 			uint64_t kb = (free_bytes / 1024ULL);
 			uint32tnfs(resp, (uint32_t)kb);
@@ -557,7 +628,7 @@ int validate_fd(Header *hdr, Session *s, unsigned char *buf, int bufsz,
 				int propersize)
 {
 	if (bufsz < propersize ||
-		*buf > MAX_FD_PER_CONN ||
+		*buf >= MAX_FD_PER_CONN ||
 		s->fd[*buf] == 0)
 	{
 #ifdef DEBUG

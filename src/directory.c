@@ -181,10 +181,16 @@ int tnfs_setroot(const char *rootdir)
 	if (strlen(rootdir) > MAX_ROOT)
 		return -1;
 
+	/* realroot is what validate_path() compares every listing against. If
+	 * it cannot be resolved it stays indeterminate and every confinement
+	 * check runs against garbage, so refuse to start instead. tnfsd.c
+	 * already reports a -1 here as "Invalid root directory". */
 #ifdef WIN32
-	GetFullPathNameA(rootdir, MAX_ROOT, realroot, NULL);
+	if (GetFullPathNameA(rootdir, MAX_ROOT, realroot, NULL) == 0)
+		return -1;
 #else
-	realpath(rootdir, realroot);
+	if (realpath(rootdir, realroot) == NULL)
+		return -1;
 #endif
 
 	strlcpy(root, rootdir, MAX_ROOT);
@@ -288,10 +294,15 @@ int validate_path(Session *s, const char *path)
 #else
 	char valpath[MAX_FILEPATH];
 
+	/* On failure valpath is left indeterminate, so the strstr() below would
+	 * run over uninitialized stack and could match by accident. Treat an
+	 * unresolvable path as outside the root. */
 #ifdef WIN32
-	GetFullPathNameA(path, MAX_FILEPATH, valpath, NULL);
+	if (GetFullPathNameA(path, MAX_FILEPATH, valpath, NULL) == 0)
+		return 0;
 #else
-	realpath(path, valpath);
+	if (realpath(path, valpath) == NULL)
+		return 0;
 #endif
 
 #ifdef DEBUG
@@ -509,8 +520,9 @@ void tnfs_readdir(Header *hdr, Session *s, unsigned char *databuf, int datasz)
 	char reply[MAX_FILENAME_LEN];
 
 	if (datasz != 1 ||
-		*databuf > MAX_DHND_PER_CONN ||
-		!s->dhandles[*databuf].open)
+		*databuf >= MAX_DHND_PER_CONN ||
+		!s->dhandles[*databuf].open ||
+		s->dhandles[*databuf].handle == NULL)
 	{
 		hdr->status = TNFS_EBADF;
 		tnfs_send(s, hdr, NULL, 0);
@@ -565,7 +577,7 @@ void tnfs_readdir(Header *hdr, Session *s, unsigned char *databuf, int datasz)
 void tnfs_closedir(Header *hdr, Session *s, unsigned char *databuf, int datasz)
 {
 	if (datasz != 1 ||
-		*databuf > MAX_DHND_PER_CONN ||
+		*databuf >= MAX_DHND_PER_CONN ||
 		!s->dhandles[*databuf].open)
 	{
 		hdr->status = TNFS_EBADF;
@@ -573,7 +585,18 @@ void tnfs_closedir(Header *hdr, Session *s, unsigned char *databuf, int datasz)
 		return;
 	}
 
-	s->dhandles[*databuf].open = false;
+	dir_handle *dh = &s->dhandles[*databuf];
+
+	dh->open = false;
+
+	/* Plain OPENDIR caches nothing, so release the fd here; every reclaim path
+	 * keys off 'loaded', which plain OPENDIR never sets. A loaded (OPENDIRX)
+	 * handle keeps its entry list and is freed by _tnfs_free_dir_handle(). */
+	if (!dh->loaded && dh->handle != NULL)
+	{
+		closedir((DIR *)dh->handle);
+		dh->handle = NULL;
+	}
 
 	hdr->status = TNFS_SUCCESS;
 	tnfs_send(s, hdr, NULL, 0);
@@ -638,7 +661,7 @@ void tnfs_seekdir(Header *hdr, Session *s, unsigned char *databuf, int datasz)
 	// databuf holds our directory handle
 	// followed by 4 bytes for the new position
 	if (datasz != 5 ||
-		*databuf > MAX_DHND_PER_CONN ||
+		*databuf >= MAX_DHND_PER_CONN ||
 		!s->dhandles[*databuf].open ||
 		(s->dhandles[*databuf].entry_list == NULL && s->dhandles[*databuf].handle == NULL))
 	{
@@ -681,7 +704,7 @@ void tnfs_telldir(Header *hdr, Session *s, unsigned char *databuf, int datasz)
 
 	// databuf holds our directory handle: check it
 	if (datasz != 1 ||
-		*databuf > MAX_DHND_PER_CONN ||
+		*databuf >= MAX_DHND_PER_CONN ||
 		!s->dhandles[*databuf].open ||
 		(s->dhandles[*databuf].entry_list == NULL && s->dhandles[*databuf].handle == NULL))
 	{
@@ -729,7 +752,7 @@ void tnfs_readdirx(Header *hdr, Session *s, unsigned char *databuf, int datasz)
 	uint8_t sid;
 	// databuf holds our directory handle followed by number of entries requested
 	if (datasz != 2 ||
-		(sid = databuf[0]) > MAX_DHND_PER_CONN)
+		(sid = databuf[0]) >= MAX_DHND_PER_CONN)
 	{
 		hdr->status = TNFS_EBADF;
 		tnfs_send(s, hdr, NULL, 0);
@@ -758,6 +781,10 @@ void tnfs_readdirx(Header *hdr, Session *s, unsigned char *databuf, int datasz)
 #endif
 		hdr->status = TNFS_EOF;
 		tnfs_send(s, hdr, NULL, 0);
+		/* Without this the EOF reply is followed by a second, built reply
+		 * for the same request: two datagrams for one seqno, which desyncs
+		 * the client and overwrites the retransmit buffer. */
+		return;
 	}
 
 #ifdef DEBUG
@@ -913,6 +940,9 @@ int _load_directory(dir_handle *dirh, uint8_t diropts, uint8_t sortopts, uint16_
 
 	// Free any existing entries
 	dirlist_free(dirh->entry_list);
+	/* Don't leave a dangling pointer for the early return below to strand;
+	 * _tnfs_free_dir_handle() would dirlist_free() it a second time. */
+	dirh->current_entry = dirh->entry_list = NULL;
 	dirh->entry_count = 0;
 
 	if ((dirh->handle = opendir(dirh->path)) == NULL)
@@ -948,7 +978,10 @@ int _load_directory(dir_handle *dirh, uint8_t diropts, uint8_t sortopts, uint16_
 		// Try to stat the file before we can decide on other things
 		fileinfo_t finf;
 		snprintf(temp_statpath, sizeof(temp_statpath), "%s%c%s", dirh->path, FILEINFO_PATHSEPARATOR, entry->d_name);
-		strncpy(statpath, temp_statpath, sizeof(statpath));
+		/* temp_statpath is twice the size of statpath, so a long enough
+		 * dir + entry name leaves strncpy's copy unterminated and the
+		 * stat() below reads off the end of the buffer. */
+		strlcpy(statpath, temp_statpath, sizeof(statpath));
 		if (get_fileinfo(statpath, &finf) == 0)
 		{
 			/* If it's not a directory and we have a pattern that this doesn't match, skip it
@@ -1303,19 +1336,23 @@ void _tnfs_free_dir_handle(dir_handle* dhandle)
 	#ifdef TNFS_DIR_EXT
 	/* deallocate ext iterator */
 	struct tnfs_opendir_ext *handle = (struct tnfs_opendir_ext*) dhandle->handle;
-	for(int i = 0; i < handle->total; ++i)
+	/* A slot can be reclaimed before opendir succeeded, leaving no iterator. */
+	if (handle != NULL)
 	{
-		free(handle->namelist[i]);
+		for(int i = 0; i < handle->total; ++i)
+		{
+			free(handle->namelist[i]);
+		}
+		if(handle->namelist) free(handle->namelist);
+		if(handle->wildcard) free(handle->wildcard);
+		if(handle->ignore_patterns)
+		{
+			for (int i = 0; i < handle->ignore_count; ++i)
+				free(handle->ignore_patterns[i]);
+			free(handle->ignore_patterns);
+		}
+		free(handle);
 	}
-	if(handle->namelist) free(handle->namelist);
-	if(handle->wildcard) free(handle->wildcard);
-	if(handle->ignore_patterns)
-	{
-		for (int i = 0; i < handle->ignore_count; ++i)
-			free(handle->ignore_patterns[i]);
-		free(handle->ignore_patterns);
-	}
-	free(handle);
 #else
 	if (dhandle->handle != NULL)
 	{
@@ -1332,12 +1369,23 @@ void _tnfs_free_dir_handle(dir_handle* dhandle)
 	dirlist_free(dhandle->entry_list);
 	dhandle->current_entry = dhandle->entry_list = NULL;
 	dhandle->entry_count = 0;
+	dhandle->open = false;
 	dhandle->loaded = false;
 }
 
 void _tnfs_init_dhandle(dir_handle* dhandle, const char *path, uint8_t diropt, uint8_t sortopt, const char *pattern)
 {
 	time_t now = time(NULL);
+
+#ifndef TNFS_DIR_EXT
+	/* Recycled slot: the caller overwrites ->handle, so don't inherit a stale one. */
+	if (dhandle->handle != NULL)
+	{
+		closedir((DIR *)dhandle->handle);
+		dhandle->handle = NULL;
+	}
+#endif
+
 	strlcpy(dhandle->path, path, MAX_TNFSPATH);
 	if (pattern == NULL)
 	{

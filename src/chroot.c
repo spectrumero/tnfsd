@@ -61,6 +61,22 @@ void chroot_tnfs(const char *user, const char *group, const char *newroot)
 		exit(-1);
 	}
 
+	/* A cwd left outside the new root is itself a way back out, so move
+	 * into the jail before dropping privileges. */
+	if(chdir("/") == -1)
+	{
+		perror("chdir");
+		exit(-1);
+	}
+
+	/* setgid() does not touch the supplementary groups, so root's would
+	 * survive the switch. Clear them while we still can. */
+	if(setgroups(0, NULL) == -1)
+	{
+		perror("setgroups");
+		exit(-1);
+	}
+
 	/* drop the group privileges first */
 	if(setgid(grp->gr_gid) == -1)
 	{

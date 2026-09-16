@@ -25,6 +25,7 @@
  *
  * */
 
+#include <signal.h>
 #include <sys/types.h>
 
 #ifdef UNIX
@@ -43,6 +44,8 @@
 
 #include "stats.h"
 #include "tnfs.h"
+
+extern volatile sig_atomic_t tnfs_stop_requested;
 
 /* Handle the socket interface */
 int tnfs_sockinit(int port);

@@ -12,12 +12,15 @@
 
 If using Windows with cygwin, it's probable you'll need to use
 make `OS=LINUX` instead since Cygwin looks more like Linux than Windows.
-You might have to remove the `-DENABLE_CHROOT` from the Makefile, though
-since I'm not sure chrooting is supported under Cygwin.
+You might have to build with `ENABLE_CHROOT=no`, though, since I'm not
+sure chrooting is supported under Cygwin:
+
+```
+make OS=LINUX ENABLE_CHROOT=no
+```
 
 To make a debug version, use `make OS=osname DEBUG=yes`. This will add
 some extra debugging messages and add the -g flag to the compilation 
 options.
 
 To output basic usage log on stdout, use `make OS=osname USAGELOG=yes`.
-

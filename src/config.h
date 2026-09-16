@@ -26,7 +26,8 @@
 #define MAX_FD_PER_CONN	16	/* maximum open file descriptors per client */
 #define MAX_DHND_PER_CONN 8	/* max open directories per client */
 #define MAX_SESSIONS        4096   /* maximum number of opened sessions */
-#define MAX_SESSIONS_PER_IP 4096   /* maximum number of sessions from a single IP */
+#define MAX_SESSIONS_PER_IP 16     /* max sessions from one IP. Must stay well below
+                                      MAX_SESSIONS or MOUNT never recycles. */
 #define MAX_TCP_CONN        4096   /* maximum number of TCP connections */
 #define SESSION_TIMEOUT 600 /* Sessions are thrown out after no contact for this many seconds. 0 = no timeout */
 #define CONN_TIMEOUT    600 /* TCP connections are thrown out after no contact for this many seconds. 0 = no timeout */
@@ -46,5 +47,10 @@
 #define TCP_KA_IDLE 30 /* the time (in seconds) the connection needs to remain idle before TCP starts sending keepalive probes */
 #define TCP_KA_INTVL 1  /* the time (in seconds) between individual keepalive probes */
 #define TCP_KA_COUNT 60 /* the maximum number of keepalive probes TCP should send before dropping the connection */
+#define TCP_SEND_TIMEOUT 30 /* max seconds a send() to a client may stall */
+#define TCP_ACCEPT_RESOURCE_BACKOFF_MS 100 /* Windows only: pause before retrying accept()
+                                              after socket-handle exhaustion */
+#define SESSION_SWEEP_INTERVAL 10 /* how often the main loop reaps timed-out sessions */
+#define ACCEPT_WARN_INTERVAL 10 /* minimum seconds between accept() failure warnings */
 
 #endif
